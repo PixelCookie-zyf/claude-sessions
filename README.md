@@ -64,6 +64,16 @@ Requirements: Python 3.8+ and a recent fzf (developed with fzf 0.74). Built and 
 
 The preview sits beside the list in wide terminals and moves below it in narrow ones.
 
+### Action menu
+
+`enter` opens a menu for the selected session:
+
+![action menu](docs/actions.png)
+
+- **resume** and **fork** switch this terminal to Claude.
+- **new pane**, **new tab**, **copy id**, **copy command** and **rename** do their job and bring you back to the list, with your search intact.
+- **new pane** and **new tab** only appear inside [Rex](https://rex.superlogical.com). For a session that is still running elsewhere they fork it rather than resuming it twice.
+
 ### Environment
 
 | variable | default | purpose |
