@@ -175,11 +175,11 @@ def parse_ts(s):
 
 def scan(path, prev):
     st = os.stat(path)
-    m = prev if prev and prev.get("size", 0) <= st.st_size and prev.get("v") == 2 else None
+    m = prev if prev and prev.get("size", 0) <= st.st_size and prev.get("v") == 3 else None
     if m and m["size"] == st.st_size:
         return m
     if not m:
-        m = dict(v=2, id=os.path.basename(path)[:-6], path=path, off=0, cwd=None, branch=None, first=None,
+        m = dict(v=3, id=os.path.basename(path)[:-6], path=path, off=0, cwd=None, cwd0=None, branch=None, first=None,
                  prompts=0, assistant=0, last_msg=None, custom=None, ai=None, summary=None, cost=0.0, tokens=0,
                  started=None, model=None)
     with open(path, "rb") as f:
@@ -227,6 +227,8 @@ def scan(path, prev):
                                             "cacheCreationInputTokens"))
             else:
                 m["cwd"] = obj.get("cwd") or m["cwd"]
+                if not m.get("cwd0") and obj.get("cwd"):
+                    m["cwd0"] = obj["cwd"]  # where the session started: Claude Code files it under this folder
                 m["branch"] = obj.get("gitBranch") or m["branch"]
                 k, text = user_text(obj)
                 if k == "prompt":
@@ -270,6 +272,15 @@ def load_index(verbose=False):
     return sorted((m for m in idx.values() if m.get("prompts")), key=lambda m: -m.get("mtime", 0))
 
 
+def home_dir(m):
+    """Directory Claude Code files this session under (its start cwd); --resume must run from there."""
+    slug = os.path.basename(os.path.dirname(m.get("path", "")))
+    for cand in (m.get("cwd0"), m.get("cwd")):
+        if cand and re.sub(r"[^A-Za-z0-9]", "-", cand) == slug:
+            return cand
+    return m.get("cwd0") or m.get("cwd")
+
+
 def title_of(m):
     if m.get("custom"):
         return m["custom"], "custom"
@@ -283,7 +294,7 @@ def title_of(m):
 def in_scope(m, here):
     if not here:
         return True
-    cwd = m.get("cwd") or ""
+    cwd = home_dir(m) or ""
     return cwd == here or cwd.startswith(here.rstrip("/") + "/")
 
 
@@ -298,7 +309,7 @@ def row(m, w):
     dot = c("•", P["good"]) if live else " "
     a = ago(m.get("mtime", now))
     age = c(a.rjust(4), P["accent"] if now - m.get("mtime", 0) < 3600 else P["dim"])
-    proj_name = os.path.basename((m.get("cwd") or "?").rstrip("/")) or "/"
+    proj_name = os.path.basename((home_dir(m) or "?").rstrip("/")) or "/"
     pw = 14 if w >= 70 else 10
     proj = c(fit(proj_name, pw), project_color(proj_name))
     title, kind = title_of(m)
@@ -417,7 +428,7 @@ def cmd_preview(sid):
     title, kind = title_of(m)
     rule = c("─" * max(10, w - 2), P["line"])
     branch = m.get("branch") if m.get("branch") not in (None, "", "HEAD") else None
-    meta1 = c(tilde(m.get("cwd")), P["dim"]) + (c("   " + branch, P["fg"]) if branch else "") \
+    meta1 = c(tilde(home_dir(m)), P["dim"]) + (c("   " + branch, P["fg"]) if branch else "") \
         + (c("   " + m["model"], P["faint"]) if m.get("model") else "")
     started = datetime.fromtimestamp(m["started"]).strftime("%Y-%m-%d %H:%M") if m.get("started") else "?"
     last = ago(m["mtime"])
@@ -482,11 +493,32 @@ def cmd_resume(sid, fork=False):
     if not m:
         print(c("session not found: " + sid, P["warn"]))
         sys.exit(1)
-    cwd = m.get("cwd")
+    # fzf ran with stdin=/dev/null and `become` passes that on; Claude Code needs the real terminal
+    try:
+        tty = os.open("/dev/tty", os.O_RDWR)
+        for fd in (0, 1, 2):
+            if not os.isatty(fd):
+                os.dup2(tty, fd)
+        sys.stdin = open(0, closefd=False)
+    except OSError:
+        pass
+    cwd = home_dir(m)
     if not cwd or not os.path.isdir(cwd):
         print(c("project folder no longer exists: %s" % tilde(cwd), P["warn"]))
         sys.exit(1)
     title, _ = title_of(m)
+    if not fork and time.time() - m.get("mtime", 0) < 90:
+        sys.stdout.write("\n  " + c("This session looks active in another terminal.", P["warn"])
+                         + "\n  " + c("Resuming it twice makes both write to the same transcript.", P["dim"])
+                         + "\n\n  " + c("[f]", P["accent"]) + c(" fork instead   ", P["dim"])
+                         + c("[y]", P["accent"]) + c(" resume anyway   ", P["dim"])
+                         + c("[n]", P["accent"]) + c(" cancel  ", P["dim"]) + c("› ", P["faint"]))
+        sys.stdout.flush()
+        ans = sys.stdin.readline().strip().lower()
+        if ans.startswith("f"):
+            fork = True
+        elif not ans.startswith("y"):
+            return
     print("\n  " + c(CLAUDE_ICON, P["accent"]) + "  " + c(("forking " if fork else "resuming ") + fit(title, 60).rstrip(),
                                                           P["fg"], bold=True)
           + "\n     " + c(tilde(cwd), P["dim"]) + "\n")
