@@ -106,6 +106,10 @@ python3 scripts/make-demo.py /tmp/cc-demo
 CC_SESSIONS_PROJECTS=/tmp/cc-demo CC_SESSIONS_CACHE=/tmp/cc-demo-cache ./cc-sessions
 ```
 
+## See also
+
+[claude-statusline](https://github.com/PixelCookie-zyf/claude-statusline): a battery-style status line for Claude Code, with context breakdown, limits and reset timers.
+
 ## Credits
 
 - The logo glyph comes from [Bootstrap Icons](https://icons.getbootstrap.com/icons/claude/) (MIT). It is repackaged as a one-glyph font at U+10F914; see `fonts/LICENSE-bootstrap-icons`.
