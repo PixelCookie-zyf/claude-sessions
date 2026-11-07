@@ -1,0 +1,571 @@
+#!/usr/bin/env -S python3 -I
+"""cc-sessions: browse, preview, rename and resume Claude Code sessions.
+
+  cc-sessions            pick from every project (fzf UI)
+  cc-sessions .          only sessions started in the current directory (or below)
+  cc-sessions ls [.]     plain table, no UI
+  cc-sessions -h         help
+
+Environment:
+  CC_SESSIONS_PROJECTS   transcripts root   (default ~/.claude/projects)
+  CC_SESSIONS_CACHE      index/preview cache (default ~/.cache/cc-sessions)
+  CC_SESSIONS_ICON       logo glyph override (default: Claude mark if the ClaudeMark font is installed, else ✻)
+  CC_SESSIONS_THEME      dark | light        (default: follows Claude Code's theme / macOS appearance)
+
+Keys: enter resume · ctrl-f fork · ctrl-r rename · ctrl-a all/here · ctrl-y copy id
+      ctrl-/ preview on/off · shift-up/down scroll preview · alt-up/down preview top/bottom
+"""
+import json, os, re, shlex, shutil, subprocess, sys, time, unicodedata
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+PROJ = os.path.expanduser(os.environ.get("CC_SESSIONS_PROJECTS") or os.path.join(HOME, ".claude", "projects"))
+CACHE = os.path.expanduser(os.environ.get("CC_SESSIONS_CACHE") or os.path.join(HOME, ".cache", "cc-sessions"))
+INDEX = os.path.join(CACHE, "index.json")
+SELF = os.path.realpath(__file__)
+
+
+def _icon():
+    """Claude mark from the bundled ClaudeMark font (U+10F914) when installed, else a plain asterisk."""
+    if os.environ.get("CC_SESSIONS_ICON"):
+        return os.environ["CC_SESSIONS_ICON"]
+    for d in (os.path.join(HOME, "Library", "Fonts"), "/Library/Fonts",
+              os.path.join(HOME, ".local", "share", "fonts"), os.path.join(HOME, ".fonts")):
+        if os.path.exists(os.path.join(d, "ClaudeMark.ttf")):
+            return "\U0010F914"
+    return "✻"
+
+
+CLAUDE_ICON = _icon()
+PREVIEW_MIN = 56   # preview goes below the list when the side pane would be narrower than this
+
+# ─────────────────────────── palette (same family as the statusline) ───────────────────────────
+PALETTES = {
+    "dark": dict(fg=(224, 222, 216), dim=(140, 138, 132), faint=(96, 95, 92), accent=(217, 119, 87),
+                 good=(118, 190, 140), warn=(224, 174, 92), sel=(44, 44, 47), line=(70, 70, 68),
+                 hues=[(150, 138, 214), (96, 156, 222), (84, 186, 176), (214, 172, 92), (208, 132, 178),
+                       (217, 119, 87), (140, 190, 110)]),
+    "light": dict(fg=(38, 38, 36), dim=(108, 106, 100), faint=(160, 158, 152), accent=(196, 94, 62),
+                  good=(42, 138, 78), warn=(184, 126, 26), sel=(236, 234, 228), line=(206, 204, 198),
+                  hues=[(116, 98, 196), (50, 112, 196), (28, 138, 128), (176, 126, 28), (176, 82, 140),
+                        (196, 94, 62), (80, 140, 50)]),
+}
+RESET = "\x1b[0m"
+
+
+def theme():
+    name = None
+    for p in (os.path.join(HOME, ".claude", "settings.json"), os.path.join(HOME, ".claude.json")):
+        try:
+            with open(p) as f:
+                name = json.load(f).get("theme")
+        except Exception:
+            continue
+        if name:
+            break
+    if not name or name == "auto":
+        try:
+            r = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"], capture_output=True, text=True,
+                               timeout=0.5)
+            return "dark" if "Dark" in r.stdout else "light"
+        except Exception:
+            return "dark"
+    return "light" if "light" in name else "dark"
+
+
+P = PALETTES[os.environ.get("CC_SESSIONS_THEME") or theme()]
+
+
+def c(text, color, bold=False):
+    return ("\x1b[1m" if bold else "") + "\x1b[38;2;%d;%d;%dm" % color + text + RESET
+
+
+def hexc(col):
+    return "#%02x%02x%02x" % col
+
+
+# ─────────────────────────── text helpers ───────────────────────────
+CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]|\x1b\[[0-9;?]*[a-zA-Z]")
+REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+def clean(s):
+    return CTRL.sub("", REMINDER.sub("", s)).strip()
+
+
+def wch(ch):
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else (0 if unicodedata.combining(ch) else 1)
+
+
+def width(s):
+    return sum(wch(ch) for ch in s)
+
+
+def fit(s, w):
+    """Truncate/pad to exactly w columns (CJK aware)."""
+    s = " ".join(s.split())
+    if width(s) <= w:
+        return s + " " * (w - width(s))
+    out, cur = "", 0
+    for ch in s:
+        if cur + wch(ch) > w - 1:
+            break
+        out += ch
+        cur += wch(ch)
+    return out + "…" + " " * (w - 1 - cur)
+
+
+def ftok(n):
+    if not n:
+        return "—"
+    if n >= 1e9:
+        return "%.1fB" % (n / 1e9)
+    if n >= 1e6:
+        return "%.1fM" % (n / 1e6)
+    if n >= 1e3:
+        return "%dk" % round(n / 1e3)
+    return str(int(n))
+
+
+def ago(ts):
+    d = max(0, time.time() - ts)
+    for lim, div, unit in ((60, 1, "s"), (3600, 60, "m"), (86400, 3600, "h"), (86400 * 14, 86400, "d"),
+                           (86400 * 60, 86400 * 7, "w")):
+        if d < lim:
+            return "now" if unit == "s" else "%d%s" % (d // div, unit)
+    return "%dmo" % (d // (86400 * 30))
+
+
+def tilde(p):
+    return p.replace(HOME, "~", 1) if p and p.startswith(HOME) else (p or "?")
+
+
+# ─────────────────────────── transcript indexing ───────────────────────────
+MSG_ID = re.compile(rb'"id":"(msg_[A-Za-z0-9_]+)"')
+TS = re.compile(rb'"timestamp":"([^"]+)"')
+
+
+def user_text(obj):
+    """Return (kind, text) for a user line: kind is 'prompt', 'command' or None."""
+    if obj.get("isMeta") or obj.get("toolUseResult") is not None:
+        return None, ""
+    content = (obj.get("message") or {}).get("content")
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return None, ""
+        content = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(content, str):
+        return None, ""
+    m = re.search(r"<command-name>(.*?)</command-name>", content)
+    if m:
+        args = re.search(r"<command-args>(.*?)</command-args>", content, re.S)
+        return "command", (m.group(1) + (" " + args.group(1).strip() if args and args.group(1).strip() else ""))
+    if content.lstrip().startswith(("<local-command", "<command-message", "Caveat:", "<bash-", "<task-notification")):
+        return None, ""
+    text = clean(content)
+    return ("prompt", text) if text else (None, "")
+
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def scan(path, prev):
+    st = os.stat(path)
+    m = prev if prev and prev.get("size", 0) <= st.st_size and prev.get("v") == 2 else None
+    if m and m["size"] == st.st_size:
+        return m
+    if not m:
+        m = dict(v=2, id=os.path.basename(path)[:-6], path=path, off=0, cwd=None, branch=None, first=None,
+                 prompts=0, assistant=0, last_msg=None, custom=None, ai=None, summary=None, cost=0.0, tokens=0,
+                 started=None, model=None)
+    with open(path, "rb") as f:
+        f.seek(m["off"])
+        for line in f:
+            if not line.endswith(b"\n"):
+                break
+            m["off"] += len(line)
+            if m["started"] is None:
+                t = TS.search(line)
+                if t:
+                    m["started"] = parse_ts(t.group(1).decode())
+            if b'"type":"assistant"' in line[:400] or b'"type":"assistant"' in line:
+                mid = MSG_ID.search(line)
+                if mid and mid.group(1) != (m["last_msg"] or "").encode():
+                    m["assistant"] += 1
+                    m["last_msg"] = mid.group(1).decode()
+                    mm = re.search(rb'"model":"([^"]+)"', line)
+                    if mm and not mm.group(1).startswith(b"<"):
+                        m["model"] = mm.group(1).decode()
+                continue
+            kind = None
+            for key, k in ((b'"type":"custom-title"', "custom"), (b'"type":"ai-title"', "ai"),
+                           (b'"type":"summary"', "summary"), (b'"type":"cost-state"', "cost"),
+                           (b'"type":"user"', "user")):
+                if key in line:
+                    kind = k
+                    break
+            if not kind or (kind == "user" and b'"tool_result"' in line):
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if kind == "custom":
+                m["custom"] = obj.get("customTitle") or m["custom"]
+            elif kind == "ai":
+                m["ai"] = obj.get("aiTitle") or m["ai"]
+            elif kind == "summary":
+                m["summary"] = obj.get("summary") or m["summary"]
+            elif kind == "cost":
+                m["cost"] = float(obj.get("totalCostUSD") or 0)
+                m["tokens"] = sum(int(u.get(k) or 0) for u in (obj.get("modelUsage") or {}).values()
+                                  for k in ("inputTokens", "outputTokens", "cacheReadInputTokens",
+                                            "cacheCreationInputTokens"))
+            else:
+                m["cwd"] = obj.get("cwd") or m["cwd"]
+                m["branch"] = obj.get("gitBranch") or m["branch"]
+                k, text = user_text(obj)
+                if k == "prompt":
+                    m["prompts"] += 1
+                    if not m["first"]:
+                        m["first"] = text[:300]
+    m["size"], m["mtime"] = st.st_size, st.st_mtime
+    return m
+
+
+def load_index(verbose=False):
+    try:
+        with open(INDEX) as f:
+            idx = json.load(f)
+    except Exception:
+        idx = {}
+    paths = []
+    try:
+        for d in os.listdir(PROJ):
+            dp = os.path.join(PROJ, d)
+            if os.path.isdir(dp):
+                paths += [os.path.join(dp, n) for n in os.listdir(dp) if n.endswith(".jsonl")]
+    except OSError:
+        pass
+    todo = [p for p in paths if not idx.get(p) or idx[p].get("size") != os.path.getsize(p)]
+    if verbose and todo:
+        mb = sum(os.path.getsize(p) - (idx.get(p) or {}).get("off", 0) for p in todo) / 1e6
+        if mb > 20:
+            sys.stderr.write(c("  indexing %d sessions (%.0f MB)…" % (len(todo), mb), P["dim"]) + "\n")
+    for p in todo:
+        try:
+            idx[p] = scan(p, idx.get(p))
+        except Exception:
+            pass
+    idx = {p: m for p, m in idx.items() if p in set(paths)}
+    os.makedirs(CACHE, exist_ok=True)
+    tmp = INDEX + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(idx, f)
+    os.replace(tmp, INDEX)
+    return sorted((m for m in idx.values() if m.get("prompts")), key=lambda m: -m.get("mtime", 0))
+
+
+def title_of(m):
+    if m.get("custom"):
+        return m["custom"], "custom"
+    if m.get("ai"):
+        return m["ai"], "ai"
+    if m.get("summary"):
+        return m["summary"], "ai"
+    return m.get("first") or "(no prompt)", "first"
+
+
+def in_scope(m, here):
+    if not here:
+        return True
+    cwd = m.get("cwd") or ""
+    return cwd == here or cwd.startswith(here.rstrip("/") + "/")
+
+
+# ─────────────────────────── list rows ───────────────────────────
+def project_color(name):
+    return P["hues"][sum(map(ord, name)) % len(P["hues"])]
+
+
+def row(m, w):
+    now = time.time()
+    live = now - m.get("mtime", 0) < 90
+    dot = c("•", P["good"]) if live else " "
+    a = ago(m.get("mtime", now))
+    age = c(a.rjust(4), P["accent"] if now - m.get("mtime", 0) < 3600 else P["dim"])
+    proj_name = os.path.basename((m.get("cwd") or "?").rstrip("/")) or "/"
+    pw = 14 if w >= 70 else 10
+    proj = c(fit(proj_name, pw), project_color(proj_name))
+    title, kind = title_of(m)
+    right_txt = "%3d msg  %6s" % (m.get("prompts", 0), "$%.2f" % m["cost"] if m.get("cost") else "")
+    show_right = w >= 62
+    tw = w - (1 + 1 + 4 + 2 + pw + 2) - ((2 + len(right_txt)) if show_right else 0)
+    tw = max(8, tw)
+    t = fit(title, tw)
+    if kind == "custom":
+        t = c(t, P["fg"], bold=True)
+    elif kind == "ai":
+        t = c(t, P["fg"])
+    else:
+        t = c(t, P["dim"])
+    line = dot + " " + age + "  " + proj + "  " + t
+    if show_right:
+        line += "  " + c(right_txt, P["faint"])
+    return "%s\t%s\t%s" % (m["id"], m["path"], line)
+
+
+def list_width():
+    cols = int(os.environ.get("FZF_COLUMNS") or 0) or shutil.get_terminal_size((120, 40)).columns
+    if os.environ.get("FZF_COLUMNS"):
+        # must mirror fzf's rule: the threshold applies to the preview pane width (52% of the window)
+        side = cols * 0.52 >= PREVIEW_MIN
+        return int(cols * 0.48) - 6 if side else cols - 6
+    return cols - 2
+
+
+def cmd_list(here, plain=False):
+    ms = [m for m in load_index(verbose=plain) if in_scope(m, here)]
+    w = list_width()
+    if plain:
+        scope = tilde(here) if here else "all projects"
+        print(c("  %s  ·  %d sessions" % (scope, len(ms)), P["dim"]))
+        for m in ms:
+            print(row(m, w).split("\t")[2])
+        return
+    out = sys.stdout
+    for m in ms:
+        out.write(row(m, w) + "\n")
+
+
+# ─────────────────────────── preview ───────────────────────────
+def hhmm(ts):
+    return datetime.fromtimestamp(ts).strftime("%H:%M") if ts else ""
+
+
+def render_body(path):
+    out = []
+    last_role, last_day, last_msg = None, None, None
+    with open(path, "rb") as f:
+        for line in f:
+            is_user = b'"type":"user"' in line and b'"tool_result"' not in line
+            is_asst = b'"type":"assistant"' in line
+            if not (is_user or is_asst):
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            ts = parse_ts(obj.get("timestamp") or "")
+            day = datetime.fromtimestamp(ts).strftime("%a %b %d") if ts else None
+            if day and day != last_day:
+                out += ["", c("  ── %s ──" % day, P["faint"])]
+                last_day = day
+            if is_user and obj.get("type") == "user":
+                kind, text = user_text(obj)
+                if kind == "command":
+                    out.append(c("  › /" + text.lstrip("/"), P["faint"]))
+                    last_role = "cmd"
+                elif kind == "prompt":
+                    out += ["", c("▌", P["accent"]) + " " + c("You", P["fg"], bold=True) + c("  " + hhmm(ts), P["faint"])]
+                    lines = text.splitlines()
+                    for ln in lines[:40]:
+                        out.append("  " + c(ln, P["fg"]))
+                    if len(lines) > 40:
+                        out.append(c("  … %d more lines" % (len(lines) - 40), P["faint"]))
+                    last_role = "user"
+            elif is_asst and obj.get("type") == "assistant":
+                msg = obj.get("message") or {}
+                for b in msg.get("content") or []:
+                    if not isinstance(b, dict):
+                        continue
+                    if last_role != "claude" and b.get("type") in ("text", "tool_use"):
+                        out += ["", c(CLAUDE_ICON, P["accent"]) + " " + c("Claude", P["accent"], bold=True)
+                                + c("  " + hhmm(ts), P["faint"])]
+                        last_role = "claude"
+                    if b.get("type") == "text":
+                        lines = clean(b.get("text", "")).splitlines()
+                        for ln in lines[:30]:
+                            if ln.startswith("#"):
+                                out.append("  " + c(ln.lstrip("# "), P["fg"], bold=True))
+                            elif ln.startswith("```"):
+                                out.append("  " + c(ln, P["faint"]))
+                            else:
+                                out.append("  " + c(ln.replace("**", ""), P["dim"]))
+                        if len(lines) > 30:
+                            out.append(c("  … %d more lines" % (len(lines) - 30), P["faint"]))
+                    elif b.get("type") == "tool_use":
+                        inp = b.get("input") or {}
+                        hint = inp.get("description") or inp.get("file_path") or inp.get("command") or \
+                            inp.get("pattern") or inp.get("url") or inp.get("query") or ""
+                        out.append(c("  · ", P["faint"]) + c(b.get("name", "tool"), P["dim"]) + "  "
+                                   + c(" ".join(str(hint).split())[:90], P["faint"]))
+    return "\n".join(out)
+
+
+def cmd_preview(sid):
+    ms = {m["id"]: m for m in load_index()}
+    m = ms.get(sid)
+    if not m:
+        print(c("session not found", P["dim"]))
+        return
+    w = int(os.environ.get("FZF_PREVIEW_COLUMNS") or 80)
+    title, kind = title_of(m)
+    rule = c("─" * max(10, w - 2), P["line"])
+    branch = m.get("branch") if m.get("branch") not in (None, "", "HEAD") else None
+    meta1 = c(tilde(m.get("cwd")), P["dim"]) + (c("   " + branch, P["fg"]) if branch else "") \
+        + (c("   " + m["model"], P["faint"]) if m.get("model") else "")
+    started = datetime.fromtimestamp(m["started"]).strftime("%Y-%m-%d %H:%M") if m.get("started") else "?"
+    last = ago(m["mtime"])
+    meta2 = c(started + " → " + ("active now" if last == "now" else last + " ago"), P["dim"]) \
+        + c("   %d prompts" % m.get("prompts", 0), P["faint"]) \
+        + (c("   $%.2f" % m["cost"], P["fg"]) if m.get("cost") else "") \
+        + (c("   %s tokens" % ftok(m["tokens"]), P["faint"]) if m.get("tokens") else "")
+    head = [c(title if width(title) <= w - 2 else fit(title, w - 2).rstrip(), P["fg"], bold=True),
+            meta1, meta2, c(m["id"], P["faint"]), rule]
+    # body is cached per (session, size)
+    pdir = os.path.join(CACHE, "preview")
+    os.makedirs(pdir, exist_ok=True)
+    key = os.path.join(pdir, "%s-%d-%s.txt" % (sid, m["size"], "d" if P is PALETTES["dark"] else "l"))
+    body = None
+    try:
+        with open(key) as f:
+            body = f.read()
+    except OSError:
+        body = render_body(m["path"])
+        for n in os.listdir(pdir):
+            if n.startswith(sid + "-"):
+                try:
+                    os.remove(os.path.join(pdir, n))
+                except OSError:
+                    pass
+        with open(key, "w") as f:
+            f.write(body)
+    sys.stdout.write("\n".join(head) + "\n" + body.lstrip("\n") + "\n")
+
+
+# ─────────────────────────── actions ───────────────────────────
+def find(sid):
+    for m in load_index():
+        if m["id"] == sid:
+            return m
+    return None
+
+
+def cmd_rename(sid):
+    m = find(sid)
+    if not m:
+        return
+    tty = open("/dev/tty", "r+")
+    title, _ = title_of(m)
+    tty.write("\x1b[2J\x1b[H\n  " + c("Rename session", P["accent"], bold=True) + "\n\n  "
+              + c("now  ", P["faint"]) + c(title[:100], P["dim"]) + "\n")
+    if time.time() - m.get("mtime", 0) < 90:
+        tty.write("  " + c("this session looks active; a running Claude may keep its old name. "
+                           "Use /rename inside it instead.", P["warn"]) + "\n")
+    tty.write("\n  " + c("new  ", P["faint"]))
+    tty.flush()
+    name = tty.readline().strip()
+    if not name:
+        return
+    with open(m["path"], "a") as f:
+        f.write(json.dumps({"type": "custom-title", "customTitle": name, "sessionId": sid},
+                           ensure_ascii=False) + "\n")
+
+
+def cmd_resume(sid, fork=False):
+    m = find(sid)
+    if not m:
+        print(c("session not found: " + sid, P["warn"]))
+        sys.exit(1)
+    cwd = m.get("cwd")
+    if not cwd or not os.path.isdir(cwd):
+        print(c("project folder no longer exists: %s" % tilde(cwd), P["warn"]))
+        sys.exit(1)
+    title, _ = title_of(m)
+    print("\n  " + c(CLAUDE_ICON, P["accent"]) + "  " + c(("forking " if fork else "resuming ") + fit(title, 60).rstrip(),
+                                                          P["fg"], bold=True)
+          + "\n     " + c(tilde(cwd), P["dim"]) + "\n")
+    os.chdir(cwd)
+    args = ["claude", "--resume", sid] + (["--fork-session"] if fork else [])
+    os.execvp("claude", args)
+
+
+def cmd_ui(here):
+    if not shutil.which("fzf"):
+        print("cc-sessions needs fzf: brew install fzf")
+        sys.exit(1)
+    me = shlex.quote(SELF)
+    scope_here = here or os.getcwd()
+    env = dict(os.environ, CC_SESSIONS_HERE=scope_here, CC_SESSIONS_THEME="dark" if P is PALETTES["dark"] else "light")
+    lst = "%s __list \"$FZF_PROMPT\"" % me
+    toggle = ('case "$FZF_PROMPT" in all*) echo "change-prompt(here ❯ )+reload(%s __list here)";; '
+              '*) echo "change-prompt(all ❯ )+reload(%s __list all)";; esac') % (me, me)
+    hint = lambda k, d: c(k, P["dim"]) + c(" " + d, P["faint"])
+    header = "  ".join([hint("↵", "resume"), hint("^f", "fork"), hint("^r", "rename"),
+                        hint("^a", "all/here"), hint("^y", "copy id"), hint("^/", "preview")])
+    col = ",".join([
+        "fg:" + hexc(P["dim"]), "fg+:" + hexc(P["fg"]), "bg:-1", "bg+:" + hexc(P["sel"]), "gutter:-1",
+        "hl:" + hexc(P["accent"]), "hl+:" + hexc(P["accent"]), "prompt:" + hexc(P["accent"]),
+        "pointer:" + hexc(P["accent"]), "marker:" + hexc(P["good"]), "info:" + hexc(P["faint"]),
+        "border:" + hexc(P["line"]), "label:" + hexc(P["accent"]), "header:" + hexc(P["faint"]),
+        "query:" + hexc(P["fg"]), "spinner:" + hexc(P["accent"]), "separator:" + hexc(P["line"]),
+        "scrollbar:" + hexc(P["line"]), "preview-border:" + hexc(P["line"]), "preview-label:" + hexc(P["dim"]),
+    ])
+    args = [
+        "fzf", "--ansi", "--layout=reverse", "--height=100%", "--border=rounded",
+        "--border-label= %s  Claude Sessions " % CLAUDE_ICON, "--border-label-pos=3", "--padding=0,1",
+        "--prompt=" + ("here ❯ " if here else "all ❯ "), "--pointer=▌", "--marker=•", "--gutter= ", "--info=inline-right",
+        "--separator=─", "--scrollbar=│", "--delimiter=\t", "--with-nth=3", "--tiebreak=index",
+        "--no-hscroll", "--ellipsis=…", "--header=" + header, "--header-first", "--color=" + col,
+        "--with-shell=sh -c",
+        "--preview=%s __preview {1}" % me,
+        "--preview-window=right,52%%,border-left,wrap,~5,<%d(down,55%%,border-top,wrap,~5)" % PREVIEW_MIN,
+        "--bind=start:reload(%s)" % lst, "--bind=resize:reload(%s)" % lst,
+        "--bind=ctrl-a:transform:" + toggle,
+        "--bind=enter:become(%s __resume {1})" % me,
+        "--bind=ctrl-f:become(%s __resume {1} --fork)" % me,
+        "--bind=ctrl-r:execute(%s __rename {1})+reload(%s)" % (me, lst),
+        "--bind=ctrl-y:execute-silent(printf %%s {1} | pbcopy)+change-header(%s)" % (
+            "  " + c("copied session id", P["good"])),
+        "--bind=ctrl-/:toggle-preview", "--bind=alt-up:preview-top", "--bind=alt-down:preview-bottom",
+    ]
+    devnull = open(os.devnull)
+    r = subprocess.run(args, env=env, stdin=devnull)
+    sys.exit(0 if r.returncode in (0, 1, 130) else r.returncode)
+
+
+def main():
+    a = sys.argv[1:]
+    if a and a[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    if a and a[0] == "__list":
+        scope = a[1] if len(a) > 1 else "all"
+        here = os.environ.get("CC_SESSIONS_HERE") if scope.startswith("here") else None
+        return cmd_list(here)
+    if a and a[0] == "__preview":
+        return cmd_preview(a[1])
+    if a and a[0] == "__rename":
+        return cmd_rename(a[1])
+    if a and a[0] == "__resume":
+        return cmd_resume(a[1], fork="--fork" in a)
+    if a and a[0] == "ls":
+        here = os.path.realpath(os.getcwd()) if len(a) > 1 and a[1] == "." else None
+        return cmd_list(here, plain=True)
+    here = os.path.realpath(os.getcwd()) if a and a[0] == "." else None
+    load_index(verbose=True)  # warm the index before the UI opens
+    return cmd_ui(here)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except BrokenPipeError:
+        pass
