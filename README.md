@@ -18,7 +18,7 @@ preview pane, and drops you back into the right directory when you pick one.
   - The header shows the title, directory, git branch, model, time span, cost and total tokens.
   - Below it come your prompts and Claude's replies, with day separators.
   - Tool calls are folded into one line each and slash commands show as `› /cmd`.
-- **One-key actions.** You can resume, fork, rename, copy the id and switch between all projects and the current folder.
+- **Action menu.** `enter` opens a menu where you can resume, fork, resume in a new Rex pane or tab, copy the id or the full resume command, or rename. Copying, renaming and opening a pane or tab bring you back to the list, so you can keep browsing.
 - **Fast.** An incremental index in `~/.cache/cc-sessions` re-reads only what changed. On the author's machine, 250 MB of transcripts indexed in under a second the first time; after that the list opened in about 40 ms.
 - **Matches your theme.** It follows Claude Code's light/dark theme, or the macOS appearance when the theme is set to `auto`.
 - **Few dependencies.** It is a single Python 3 file with no packages to install, and uses [fzf](https://github.com/junegunn/fzf) for the UI.
@@ -51,7 +51,8 @@ Requirements: Python 3.8+ and a recent fzf (developed with fzf 0.74). Built and 
 | key | action |
 |---|---|
 | type | fuzzy-search titles and project names |
-| `enter` | `cd` into the project and run `claude --resume <id>` |
+| `enter` | open the action menu |
+| `alt-enter` | resume straight away: `cd` into the project and run `claude --resume <id>` |
 | `ctrl-f` | fork: resume into a new session id (`--fork-session`) |
 | `ctrl-r` | rename the session, the same way `/rename` does |
 | `ctrl-a` | toggle between all projects and the current folder |

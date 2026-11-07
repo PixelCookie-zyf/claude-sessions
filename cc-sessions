@@ -12,7 +12,7 @@ Environment:
   CC_SESSIONS_ICON       logo glyph override (default: Claude mark if the ClaudeMark font is installed, else ✻)
   CC_SESSIONS_THEME      dark | light        (default: follows Claude Code's theme / macOS appearance)
 
-Keys: enter resume · ctrl-f fork · ctrl-r rename · ctrl-a all/here · ctrl-y copy id
+Keys: enter actions · alt-enter resume · ctrl-f fork · ctrl-r rename · ctrl-a all/here · ctrl-y copy id
       ctrl-/ preview on/off · shift-up/down scroll preview · alt-up/down preview top/bottom
 """
 import json, os, re, shlex, shutil, subprocess, sys, time, unicodedata
@@ -527,20 +527,8 @@ def cmd_resume(sid, fork=False):
     os.execvp("claude", args)
 
 
-def cmd_ui(here):
-    if not shutil.which("fzf"):
-        print("cc-sessions needs fzf: brew install fzf")
-        sys.exit(1)
-    me = shlex.quote(SELF)
-    scope_here = here or os.getcwd()
-    env = dict(os.environ, CC_SESSIONS_HERE=scope_here, CC_SESSIONS_THEME="dark" if P is PALETTES["dark"] else "light")
-    lst = "%s __list \"$FZF_PROMPT\"" % me
-    toggle = ('case "$FZF_PROMPT" in all*) echo "change-prompt(here ❯ )+reload(%s __list here)";; '
-              '*) echo "change-prompt(all ❯ )+reload(%s __list all)";; esac') % (me, me)
-    hint = lambda k, d: c(k, P["dim"]) + c(" " + d, P["faint"])
-    header = "  ".join([hint("↵", "resume"), hint("^f", "fork"), hint("^r", "rename"),
-                        hint("^a", "all/here"), hint("^y", "copy id"), hint("^/", "preview")])
-    col = ",".join([
+def fzf_colors():
+    return ",".join([
         "fg:" + hexc(P["dim"]), "fg+:" + hexc(P["fg"]), "bg:-1", "bg+:" + hexc(P["sel"]), "gutter:-1",
         "hl:" + hexc(P["accent"]), "hl+:" + hexc(P["accent"]), "prompt:" + hexc(P["accent"]),
         "pointer:" + hexc(P["accent"]), "marker:" + hexc(P["good"]), "info:" + hexc(P["faint"]),
@@ -548,6 +536,125 @@ def cmd_ui(here):
         "query:" + hexc(P["fg"]), "spinner:" + hexc(P["accent"]), "separator:" + hexc(P["line"]),
         "scrollbar:" + hexc(P["line"]), "preview-border:" + hexc(P["line"]), "preview-label:" + hexc(P["dim"]),
     ])
+
+
+def hint(k, d):
+    return c(k, P["dim"]) + c(" " + d, P["faint"])
+
+
+HEADER_KEYS = [("↵", "actions"), ("⌥↵", "resume"), ("^f", "fork"), ("^r", "rename"),
+               ("^a", "all/here"), ("^y", "copy id"), ("^/", "preview")]
+
+
+def default_header():
+    return "  ".join(hint(k, d) for k, d in HEADER_KEYS)
+
+
+def in_rex():
+    return bool(os.environ.get("REX_BLOCK")) and shutil.which("rex") is not None
+
+
+def copy(text):
+    try:
+        subprocess.run(["pbcopy"], input=text.encode(), check=True, timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+def cmd_menu(sid):
+    """Action menu for one session (runs inside fzf `execute`). Writes the follow-up fzf action to $CC_SESSIONS_ACT."""
+    act_file = os.environ.get("CC_SESSIONS_ACT")
+    lst = os.environ.get("CC_SESSIONS_LST", "")
+    me = shlex.quote(SELF)
+    m = find(sid)
+
+    def done(action):
+        if act_file:
+            with open(act_file, "w") as f:
+                f.write(action)
+
+    def notice(msg, ok=True):
+        done("change-header(%s)" % ("  " + c(msg, P["good"] if ok else P["warn"]) + "   " + default_header()))
+
+    if not m:
+        return notice("session not found", ok=False)
+    title, _ = title_of(m)
+    cwd = home_dir(m)
+    live = time.time() - m.get("mtime", 0) < 90
+    short = tilde(cwd)
+    resume_cmd = "cd %s && claude --resume %s" % (
+        short if re.fullmatch(r"[\w@%+=:,./~-]+", short) else shlex.quote(cwd), sid)
+    items = [("resume", "resume", "open it here"),
+             ("fork", "fork", "new session id, keep the original")]
+    if in_rex():
+        items += [("pane", "new pane", "resume in a Rex pane beside this one"),
+                  ("tab", "new tab", "resume in a new Rex tab")]
+    items += [("copy-id", "copy id", sid),
+              ("copy-cmd", "copy command", resume_cmd),
+              ("rename", "rename", "set a custom title"),
+              ("back", "back", "")]
+    lines = "\n".join("%s\t%s\t%s" % (k, c(fit(lbl, 14), P["fg"]), c(d, P["faint"])) for k, lbl, d in items)
+    head = [c(fit(title, 60).rstrip(), P["fg"], bold=True),
+            c(tilde(cwd), P["dim"]) + c("   " + ago(m["mtime"]) + (" ago" if ago(m["mtime"]) != "now" else ""),
+                                       P["faint"])]
+    if live:
+        head.append(c("active in another terminal: fork is safer than resume", P["warn"]))
+    # size the box to its content and centre it on screen
+    try:
+        cols, rows = os.get_terminal_size(os.open("/dev/tty", os.O_RDONLY))
+    except OSError:
+        cols, rows = 120, 40
+    box_h = len(items) + len(head) + 1 + 2 + 2 + 1
+    box_w = max(width(re.sub(r"\x1b\[[0-9;]*m", "", ln)) for ln in lines.split("\n")) + 12
+    box_w = max(box_w, 64)
+    mv, mh = max(0, (rows - box_h) // 2), max(2, (cols - box_w) // 2)
+    r = subprocess.run(
+        ["fzf", "--ansi", "--layout=reverse", "--height=100%", "--margin=%d,%d" % (mv, mh), "--border=rounded",
+         "--border-label= %s  actions " % CLAUDE_ICON, "--border-label-pos=3", "--padding=1,2",
+         "--prompt=  ", "--pointer=▌", "--gutter= ", "--no-info", "--no-separator", "--disabled",
+         "--delimiter=\t", "--with-nth=2..", "--header=" + "\n".join(head) + "\n", "--header-first",
+         "--color=" + fzf_colors(), "--bind=esc:abort,q:abort,left:abort"],
+        input=lines.encode(), stdout=subprocess.PIPE)
+    if r.returncode != 0:
+        return
+    key = r.stdout.decode().split("\t")[0].strip()
+    if key == "resume":
+        done("become(%s __resume %s)" % (me, sid))
+    elif key == "fork":
+        done("become(%s __resume %s --fork)" % (me, sid))
+    elif key in ("pane", "tab"):
+        cmd = ["rex", "run", "--interactive"]
+        if key == "pane":
+            cmd += ["-b", os.environ["REX_BLOCK"], "--split=right"]
+        cmd += ["--", SELF, "__resume", sid] + (["--fork"] if live else [])
+        ok = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        notice(("opened in a new " + ("pane" if key == "pane" else "tab") + (" as a fork" if live else ""))
+               if ok else "could not open a Rex " + key, ok=ok)
+    elif key == "copy-id":
+        notice("copied session id" if copy(sid) else "pbcopy not available", ok=True)
+    elif key == "copy-cmd":
+        notice("copied resume command" if copy(resume_cmd) else "pbcopy not available", ok=True)
+    elif key == "rename":
+        cmd_rename(sid)
+        done("reload(%s)+change-header(%s)" % (lst, "  " + c("renamed", P["good"]) + "   " + default_header()))
+
+
+def cmd_ui(here):
+    if not shutil.which("fzf"):
+        print("cc-sessions needs fzf: brew install fzf")
+        sys.exit(1)
+    me = shlex.quote(SELF)
+    scope_here = here or os.getcwd()
+    lst = "%s __list \"$FZF_PROMPT\"" % me
+    os.makedirs(CACHE, exist_ok=True)
+    act = os.path.join(CACHE, "act-%d" % os.getpid())
+    env = dict(os.environ, CC_SESSIONS_HERE=scope_here, CC_SESSIONS_THEME="dark" if P is PALETTES["dark"] else "light",
+               CC_SESSIONS_ACT=act, CC_SESSIONS_LST=lst)
+    toggle = ('case "$FZF_PROMPT" in all*) echo "change-prompt(here ❯ )+reload(%s __list here)";; '
+              '*) echo "change-prompt(all ❯ )+reload(%s __list all)";; esac') % (me, me)
+    header = default_header()
+    col = fzf_colors()
     args = [
         "fzf", "--ansi", "--layout=reverse", "--height=100%", "--border=rounded",
         "--border-label= %s  Claude Sessions " % CLAUDE_ICON, "--border-label-pos=3", "--padding=0,1",
@@ -559,15 +666,23 @@ def cmd_ui(here):
         "--preview-window=right,52%%,border-left,wrap,~5,<%d(down,55%%,border-top,wrap,~5)" % PREVIEW_MIN,
         "--bind=start:reload(%s)" % lst, "--bind=resize:reload(%s)" % lst,
         "--bind=ctrl-a:transform:" + toggle,
-        "--bind=enter:become(%s __resume {1})" % me,
+        "--bind=enter:execute(%s __menu {1})+transform(cat %s 2>/dev/null; rm -f %s)" % (
+            me, shlex.quote(act), shlex.quote(act)),
+        "--bind=alt-enter:become(%s __resume {1})" % me,
         "--bind=ctrl-f:become(%s __resume {1} --fork)" % me,
         "--bind=ctrl-r:execute(%s __rename {1})+reload(%s)" % (me, lst),
         "--bind=ctrl-y:execute-silent(printf %%s {1} | pbcopy)+change-header(%s)" % (
-            "  " + c("copied session id", P["good"])),
+            "  " + c("copied session id", P["good"]) + "   " + header),
         "--bind=ctrl-/:toggle-preview", "--bind=alt-up:preview-top", "--bind=alt-down:preview-bottom",
     ]
     devnull = open(os.devnull)
-    r = subprocess.run(args, env=env, stdin=devnull)
+    try:
+        r = subprocess.run(args, env=env, stdin=devnull)
+    finally:
+        try:
+            os.remove(act)
+        except OSError:
+            pass
     sys.exit(0 if r.returncode in (0, 1, 130) else r.returncode)
 
 
@@ -584,6 +699,8 @@ def main():
         return cmd_preview(a[1])
     if a and a[0] == "__rename":
         return cmd_rename(a[1])
+    if a and a[0] == "__menu":
+        return cmd_menu(a[1])
     if a and a[0] == "__resume":
         return cmd_resume(a[1], fork="--fork" in a)
     if a and a[0] == "ls":
