@@ -488,20 +488,58 @@ def cmd_rename(sid):
                            ensure_ascii=False) + "\n")
 
 
+def real_tty():
+    """Device path of the controlling terminal, e.g. /dev/ttys003 (never the /dev/tty alias)."""
+    for fd in (0, 1, 2):
+        try:
+            if os.isatty(fd) and os.ttyname(fd) != "/dev/tty":
+                return os.ttyname(fd)
+        except OSError:
+            pass
+    try:
+        t = subprocess.run(["ps", "-o", "tty=", "-p", str(os.getpid())], capture_output=True, text=True,
+                           timeout=2).stdout.strip()
+        if t and "?" not in t:
+            return t if t.startswith("/") else "/dev/" + t
+    except Exception:
+        pass
+    return None
+
+
+def attach_tty():
+    """Point fds 0-2 at the terminal device before exec'ing Claude Code.
+
+    fzf runs with stdin=/dev/null and `become` passes that on. Claude Code (Bun) registers stdin
+    with kqueue, which on macOS rejects /dev/null *and* the /dev/tty alias with EINVAL, so it
+    crashes with "EINVAL: invalid argument, kqueue". Only the real device (/dev/ttysNNN) works."""
+    def ok(fd):
+        try:
+            return os.isatty(fd) and os.ttyname(fd) != "/dev/tty"
+        except OSError:
+            return False
+    bad = [fd for fd in (0, 1, 2) if not ok(fd)]
+    path = bad and real_tty()
+    if not path:
+        return
+    try:
+        tty = os.open(path, os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    for fd in bad:
+        os.dup2(tty, fd)
+    os.close(tty)
+    if 0 in bad:
+        sys.stdin = open(0, closefd=False)
+
+
 def cmd_resume(sid, fork=False):
     m = find(sid)
     if not m:
         print(c("session not found: " + sid, P["warn"]))
         sys.exit(1)
-    # fzf ran with stdin=/dev/null and `become` passes that on; Claude Code needs the real terminal
-    try:
-        tty = os.open("/dev/tty", os.O_RDWR)
-        for fd in (0, 1, 2):
-            if not os.isatty(fd):
-                os.dup2(tty, fd)
-        sys.stdin = open(0, closefd=False)
-    except OSError:
-        pass
+    attach_tty()
     cwd = home_dir(m)
     if not cwd or not os.path.isdir(cwd):
         print(c("project folder no longer exists: %s" % tilde(cwd), P["warn"]))
@@ -522,6 +560,7 @@ def cmd_resume(sid, fork=False):
     print("\n  " + c(CLAUDE_ICON, P["accent"]) + "  " + c(("forking " if fork else "resuming ") + fit(title, 60).rstrip(),
                                                           P["fg"], bold=True)
           + "\n     " + c(tilde(cwd), P["dim"]) + "\n")
+    sys.stdout.flush()  # exec drops Python's buffers; stdout may have started out block-buffered
     os.chdir(cwd)
     args = ["claude", "--resume", sid] + (["--fork-session"] if fork else [])
     os.execvp("claude", args)
@@ -602,7 +641,8 @@ def cmd_menu(sid):
         head.append(c("active in another terminal: fork is safer than resume", P["warn"]))
     # size the box to its content and centre it on screen
     try:
-        cols, rows = os.get_terminal_size(os.open("/dev/tty", os.O_RDONLY))
+        with open("/dev/tty") as t:
+            cols, rows = os.get_terminal_size(t.fileno())
     except OSError:
         cols, rows = 120, 40
     box_h = len(items) + len(head) + 1 + 2 + 2 + 1
